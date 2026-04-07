@@ -1,18 +1,28 @@
+import sys, termios, tty, subprocess
+import shutil, signal, time, random
 import undetected_chromedriver as uc
 from selenium.webdriver.common.by import By
+from selenium.webdriver.common.keys import Keys
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from bs4 import BeautifulSoup, NavigableString
 from pyvirtualdisplay import Display
-import shutil
-import random
-import signal
-import time
-import sys
+import pyperclip
 Driver=None
 HiddenDisplay=None
 RunHidden=True
 Count=0
+
+
+def get_char():
+    fd = sys.stdin.fileno()
+    old_settings = termios.tcgetattr(fd)
+    try:
+        tty.setraw(fd)
+        ch = sys.stdin.read(1)
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+    return ch
 
 def typeit(self, text):
     time.sleep(random.uniform(0.1, 0.3))
@@ -82,104 +92,151 @@ def wait_for_visible_count_to_increase(Driver, selector, previous_count, timeout
     new_count = WebDriverWait(Driver, timeout).until(condition)
     return new_count
 
-def html_to_text(element):
-    text_lines = []
+def html_to_text(element, indent=0):
+    """Convert HTML to console-friendly text with proper code block isolation and indentation."""
 
-    def extract_code(container):
-        """Reconstruct code from span/br or pre/code structures"""
+    def extract_code(pre_block):
+        """
+        Extract code from <pre><code>, ignoring toolbar UI, preserving original line breaks.
+        """
+        code_tag = pre_block.find("code") or pre_block
+
         lines = []
         current_line = []
 
-        for node in container.descendants:
+        for node in code_tag.descendants:
+            # Ignore toolbar/UI elements
+            if getattr(node, "name", None) in ["span", "button"]:
+                if "class" in node.attrs and any(cl in node["class"] for cl in ["run-button", "language-label"]):
+                    continue
+
             if isinstance(node, NavigableString):
-                current_line.append(str(node))
-            elif node.name == "br":
+                # Split text by newlines
+                parts = str(node).splitlines()
+                if parts:
+                    for i, part in enumerate(parts):
+                        if i == 0:
+                            current_line.append(part)
+                        else:
+                            # Newline detected
+                            lines.append("".join(current_line))
+                            current_line = [part]
+            elif getattr(node, "name", None) == "br":
+                # Explicit <br> → new line
                 lines.append("".join(current_line))
                 current_line = []
 
         if current_line:
             lines.append("".join(current_line))
 
+        # Remove trailing whitespace but preserve empty lines
         return "\n".join(line.rstrip() for line in lines)
 
-    def process_node(node):
-        """Process a node intelligently"""
+    def detect_language(pre_block):
+        """Detect language from class attributes in <pre> or <code>."""
+        class_attr = ""
+        if "class" in pre_block.attrs:
+            class_attr = " ".join(pre_block.attrs["class"])
+        code_tag = pre_block.find("code")
+        if code_tag and "class" in code_tag.attrs:
+            class_attr += " " + " ".join(code_tag.attrs["class"])
+        for part in class_attr.split():
+            if part.startswith("language-"):
+                return part.split("language-")[1].capitalize()
+        return None
+
+    def process_node(node, indent_level=0):
         if isinstance(node, NavigableString):
             return str(node)
 
-        # HEADERS
-        if node.name in ["h1", "h2", "h3", "h4", "h5", "h6"]:
+        # Headers
+        if node.name in ["h1","h2","h3","h4","h5","h6"]:
             return "\n" + node.get_text(" ", strip=True).upper() + "\n"
 
-        # PARAGRAPHS
+        # Paragraphs
         if node.name == "p":
-            return "\n" + process_children(node).strip() + "\n"
+            return "\n" + process_children(node, indent_level).strip() + "\n"
 
-        # STRONG / BOLD
+        # Bold / strong
         if node.name == "strong":
             return node.get_text(" ", strip=True).upper()
 
-        # INLINE CODE
+        # Inline code
         if node.name == "code" and node.parent.name != "pre":
             return f"`{node.get_text(strip=False)}`"
 
-        # BLOCK CODE
+        # Block code
         if node.name == "pre":
             code_text = extract_code(node)
-            return f"\n\n{code_text}\n\n"
+            code_lines = [line.rstrip() for line in code_text.splitlines()]
+            code_text = "\n".join(code_lines).strip()
+            if not code_text:
+                return ""
+            width = max(len(line) for line in code_lines) if code_lines else 40
+            border = "-" * min(width, 120)
+            lang = detect_language(node)
+            # Indent all lines according to list nesting
+            indented_lines = "\n".join("  "*indent_level + line for line in code_lines)
+            framed = f"{border}\n{indented_lines}\n{border}"
+            if lang:
+                framed = f"{lang}\n{framed}"
+            return f"\n{framed}\n"
 
-        # LISTS
-        #if node.name == "ul":
-        #    return "\n".join(f"* {li.get_text(strip=True)}" for li in node.find_all("li", recursive=False)) + "\n"
+        # Tables
+        if node.name == "table":
+            return process_table(node, indent_level)
 
-        #if node.name == "ol":
-        #   return "\n".join(f"{i+1}. {li.get_text(strip=True)}"
-        #                     for i, li in enumerate(node.find_all("li", recursive=False))) + "\n"
-
+        # Unordered list
         if node.name == "ul":
-            # Use asterisk for unordered lists
             bullet_lines = []
             for li in node.find_all("li", recursive=False):
-                bullet_lines.append(f"* {li.get_text(strip=True)}")
+                line = "  "*indent_level + "* " + process_children(li, indent_level + 1).strip()
+                bullet_lines.append(line)
             return "\n".join(bullet_lines) + "\n"
 
+        # Ordered list
         if node.name == "ol":
-            # Use numbers for ordered lists
             bullet_lines = []
             for i, li in enumerate(node.find_all("li", recursive=False), start=1):
-                bullet_lines.append(f"{i}. {li.get_text(strip=True)}")
+                line = "  "*indent_level + f"{i}. " + process_children(li, indent_level + 1).strip()
+                bullet_lines.append(line)
             return "\n".join(bullet_lines) + "\n"
 
+        # Default: process children
+        return process_children(node, indent_level)
 
-        # DIV / SECTION — detect code-like blocks
-        if node.name in ["div", "section"]:
-            spans = node.find_all("span")
-            brs = node.find_all("br")
-
-            # Heuristic: code block (like ChatGPT / CodeMirror)
-            if len(spans) >= 3 and len(brs) >= 1:
-                code_text = extract_code(node)
-                return f"\n\n{code_text}\n\n"
-
-            return process_children(node)
-
-        # DEFAULT
-        return process_children(node)
-
-    def process_children(parent):
+    def process_children(parent, indent_level=0):
         parts = []
         for child in parent.children:
-            parts.append(process_node(child))
+            parts.append(process_node(child, indent_level))
         return "".join(parts)
 
-    result = process_children(element)
+    def process_table(table, indent_level=0):
+        rows = []
+        col_widths = []
+        for tr in table.find_all("tr"):
+            row = []
+            for td in tr.find_all(["td","th"]):
+                row.append(td.get_text(" ", strip=True))
+            if row:
+                rows.append(row)
+                if len(col_widths) < len(row):
+                    col_widths.extend([0]*(len(row)-len(col_widths)))
+                for i, cell in enumerate(row):
+                    col_widths[i] = max(col_widths[i], len(cell))
+        table_lines = []
+        for r, row in enumerate(rows):
+            padded_cells = [row[i].ljust(col_widths[i]) for i in range(len(row))]
+            line = " | ".join(padded_cells)
+            table_lines.append("  "*indent_level + line)
+            if r == 0 and table.find("th"):
+                sep = " | ".join("-"*col_widths[i] for i in range(len(row)))
+                table_lines.append("  "*indent_level + sep)
+        return "\n".join(table_lines) + "\n"
 
-    # Cleanup: fix excessive whitespace but KEEP code formatting
+    result = process_children(element, indent)
     lines = result.splitlines()
-    cleaned = []
-    for line in lines:
-        cleaned.append(line.rstrip())
-
+    cleaned = [line.rstrip() for line in lines]
     return "\n".join(cleaned).strip()
 
 def wait_for_text_stable(Driver, locator, last_result_stable_text, timeout=60, poll_frequency=0.5, stable_time=1.0):
@@ -251,9 +308,7 @@ def monitor_stayloggedout():
     """)
 
 def InitWebSession(url, hidden=True):
-    global Driver
-    global HiddenDisplay
-    global RunHidden 
+    global Driver, HiddenDisplay, RunHidden 
     RunHidden = hidden
 
     # Start virtual display
@@ -273,25 +328,41 @@ def InitWebSession(url, hidden=True):
     time.sleep(random.uniform(1, 3))
 
 def EndSession():
-    # Cleanup
-    Driver.quit()
-    if(RunHidden):
-        HiddenDisplay.stop()
+    global HiddenDisplay, Driver
 
-def SendPrompt(prompt):
+    def kill_chrome():
+        try:
+            subprocess.run(["pkill", "-f", "chrome"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            subprocess.run(["pkill", "-f", "chromedriver"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except Exception:
+            pass
+
+    if Driver:
+        try:
+            Driver.quit()
+        except Exception:
+            pass
+        Driver = None
+
+    # Give Chrome time to die gracefully
+    time.sleep(1)
+
+    kill_chrome()
+
+    time.sleep(1)
+
+    if HiddenDisplay:
+        try:
+            HiddenDisplay.stop()
+        except Exception:
+            pass
+        HiddenDisplay = None
+
+def GetResponse(prompt):
     global Count
     stable_text=""
 
     try:
-        prompt_field = Driver.find_element(By.XPATH, "//p[contains(@class, 'placeholder')]")
-        prompt_field.click()
-
-        typeit( prompt_field, prompt )  
-        #print(1)
-        btn = Driver.find_element(By.XPATH, "//button[contains(@class, 'composer-submit-btn')]")
-        btn.click()
-        #print(2)
-
         #wait for the copy button count to increase
         #print(f"Count:{Count}")
         selector = "button.text-token-text-secondary"
@@ -338,6 +409,54 @@ def ColouriseLastInput(prompt):
     clear_lines(line_count)
     print(f"\033[34m{prompt.capitalize()}\033[0m")
 
+def PromptLoop():
+    global Driver
+    promptText = ""
+
+    def GetPromptField():
+        nonlocal promptText
+        prompt_field = WebDriverWait(Driver, 10).until(
+                        EC.element_to_be_clickable((By.XPATH, "//p[contains(@class, 'placeholder')]"))
+            )
+        promptText = ""
+        prompt_field.click()
+        print(f"\033[34m\nYou:\033[0m", end="", flush=True)
+        return prompt_field
+
+    pyperclip.copy("During this conversation keep all responses as terse as possible while relaying all of the requested information. ")
+    prompt_field = GetPromptField()
+    prompt_field.send_keys(Keys.CONTROL, "v")  #
+
+    while True:
+        key = get_char()
+        if key == "\r" or key == "\n":  # Enter
+
+            print()
+
+            if promptText.lower() == "quit":
+                print("Exiting ...")
+                break  # stops the loop
+
+            else:
+                submit_btn = WebDriverWait(Driver, 10).until(
+                    EC.element_to_be_clickable((By.XPATH, "//button[contains(@class, 'composer-submit-btn')]"))
+                )
+                submit_btn.click()
+                ColouriseLastInput("You: " + promptText)
+                print(GetResponse(promptText).replace("CHATGPT SAID:\n\n","\nBot:"))
+                prompt_field = GetPromptField()
+
+        elif key == "\x7f":  # Backspace
+            promptText = promptText[:-1] 
+            prompt_field.send_keys(Keys.BACKSPACE)
+            print("\b \b", end="", flush=True) # move back on char write empty space over the char then move back one again
+
+        else:
+            promptText += key #build prompt string
+            prompt_field.send_keys(key)
+            print(key, end="", flush=True)
+
+
 
 ### Script ###
 
@@ -353,25 +472,7 @@ except:
 
 InitWebSession("https://chatgpt.com", runHidden)
 
-firstPrompt=True
-while True:
+PromptLoop()
 
-    prompt = input(f"\033[34m\nYou:\033[0m")
+EndSession()
 
-    if prompt.lower() == "quit":
-        print("Exiting loop...")
-        EndSession()
-        break  # stops the loop
-
-    #print the prompt to the screen so its pretty
-    ColouriseLastInput("You: " + prompt)
-
-    # include a "system prompt" on the first request
-    if firstPrompt:
-        prompt = "During this conversation keep all responses as terse as possible while relaying all of the requested information. " + prompt
-        firstPrompt=False
-
-    #send the prompt
-    response = SendPrompt(prompt)
-    #print("\033[F\033[K", end="")  # F = up one line, K = clear line
-    print(response.replace("CHATGPT SAID:\n\n","\nBot:"))
