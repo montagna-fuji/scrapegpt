@@ -7,15 +7,16 @@ from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from bs4 import BeautifulSoup, NavigableString
 from pyvirtualdisplay import Display
-import pyperclip, webbrowser, os
+import pyperclip, os
+
 WebDriver=None
 WebDriverDisplay=None
+REAL_DISPLAY = os.environ.get("DISPLAY", ":0")
 VncServer=None
 VncWebSock=None
 RunHidden=True
 ServerLogFile=None
 Count=0
-
 
 
 def get_char():
@@ -470,7 +471,7 @@ def ColouriseLastInput(prompt):
     print(f"\033[34m{prompt.capitalize()}\033[0m")
 
 def PromptLoop():
-    global WebDriver, WebDriverDisplay, ServerLogFile
+    global WebDriver, WebDriverDisplay, ServerLogFile, REAL_DISPLAY
     promptText = ""
     help_text = """
     quit - ends the session closing the webdriver
@@ -494,24 +495,32 @@ def PromptLoop():
         write_prompt()        
         return prompt_field
 
+    # simulate a copy paste of the "system prompt"
     pyperclip.copy("During this conversation keep all responses as terse as possible while relaying all of the requested information. ")
     prompt_field = GetPromptField()
-    prompt_field.send_keys(Keys.CONTROL, "v")  #
+    prompt_field.send_keys(Keys.CONTROL, "v")  #paste from the clipboard
 
     while True:
         key = get_char()
+
         if key == "\r" or key == "\n":  # Enter
 
-            print()
-
+            print() # add the newline to the console
             if promptText.lower() == "quit":
                 print("Exiting ...")
                 break  # stops the loop
             elif promptText.lower() == "view display":
-                # Launch VNC viewer
+                # --- Launch VCN Viewer in Firefox on REAL display ---
+                ffenv = os.environ.copy() #copy the env variable for modification so you dont disrupt the processes using the virtual display
+                ffenv["DISPLAY"] = REAL_DISPLAY   # force real screen
                 subprocess.Popen(
-                    ["firefox", "http://127.0.0.1:6080/vnc.html", # Open the URL using the default browser chosen by the OS
-                     "--new‐window"],
+                    [
+                        "firefox", 
+                        #"--new-instance",   # important
+                        #"--no-remote",      # prevents reuse of hidden instance
+                        "http://127.0.0.1:6080/vnc.html"  # Open the URL using the default browser chosen by the OS
+                    ],
+                    env=ffenv,
                     stdout=ServerLogFile,
                     stderr=ServerLogFile
                 )
