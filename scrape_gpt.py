@@ -7,11 +7,15 @@ from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from bs4 import BeautifulSoup, NavigableString
 from pyvirtualdisplay import Display
-import pyperclip
-Driver=None
-HiddenDisplay=None
+import pyperclip, webbrowser, os
+WebDriver=None
+WebDriverDisplay=None
+VncServer=None
+VncWebSock=None
 RunHidden=True
+ServerLogFile=None
 Count=0
+
 
 
 def get_char():
@@ -37,12 +41,12 @@ def typeit(self, text):
             time.sleep(random.uniform(0.02, 0.07))
 
 def scrollit( pause_min=0.2, pause_max=0.8):
-    global Driver
-    last_height = Driver.execute_script("return document.body.scrollHeight")
+    global WebDriver
+    last_height = WebDriver.execute_script("return document.body.scrollHeight")
     
     while True:
-        current_position = Driver.execute_script("return window.pageYOffset")
-        viewport_height = Driver.execute_script("return window.innerHeight")
+        current_position = WebDriver.execute_script("return window.pageYOffset")
+        viewport_height = WebDriver.execute_script("return window.innerHeight")
         remaining = last_height - (current_position + viewport_height)
 
         # Fast reader: larger, quicker scrolls
@@ -51,7 +55,7 @@ def scrollit( pause_min=0.2, pause_max=0.8):
         else:
             scroll_step = random.randint(300, 700)
 
-        Driver.execute_script(f"window.scrollBy(0, {scroll_step});")
+        WebDriver.execute_script(f"window.scrollBy(0, {scroll_step});")
 
         # Short pauses (fast reading)
         time.sleep(random.uniform(pause_min, pause_max))
@@ -59,11 +63,11 @@ def scrollit( pause_min=0.2, pause_max=0.8):
         # Rare small upward correction (quick skim behavior)
         if random.random() < 0.07:
             up_step = random.randint(50, 120)
-            Driver.execute_script(f"window.scrollBy(0, -{up_step});")
+            WebDriver.execute_script(f"window.scrollBy(0, -{up_step});")
             time.sleep(random.uniform(0.1, 0.3))
 
         # Handle dynamic/infinite scroll
-        new_height = Driver.execute_script("return document.body.scrollHeight")
+        new_height = WebDriver.execute_script("return document.body.scrollHeight")
         if new_height > last_height:
             last_height = new_height
 
@@ -72,7 +76,7 @@ def scrollit( pause_min=0.2, pause_max=0.8):
             break
 
     # Quick final push to ensure bottom
-    Driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
+    WebDriver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
 
 def wait_for_visible_count_to_increase(Driver, selector, previous_count, timeout=10):
     """
@@ -287,8 +291,8 @@ def wait_for_text_stable(Driver, locator, last_result_stable_text, timeout=60, p
     return last_text
 
 def monitor_stayloggedout():
-    global Driver
-    Driver.execute_script("""
+    global WebDriver
+    WebDriver.execute_script("""
         const observer = new MutationObserver(() => {
             const links = document.querySelectorAll('a[href="#"]');
 
@@ -308,27 +312,69 @@ def monitor_stayloggedout():
     """)
 
 def InitWebSession(url, hidden=True):
-    global Driver, HiddenDisplay, RunHidden 
+    global WebDriver, WebDriverDisplay, VncServer, VncWebSock, RunHidden, ServerLogFile
     RunHidden = hidden
 
     # Start virtual display
     if RunHidden:
-        HiddenDisplay = Display(visible=0, size=(1920, 1080))
-        HiddenDisplay.start()
+        WebDriverDisplay = Display(visible=0, size=(1920, 1080))
+        WebDriverDisplay.start()
+
+        ServerLogFile = open("chat_servers.log", "a")  # 'a' = append mode
+
+        # Give it time to start
+        time.sleep(1)
+
+        VNC_PORT=5900
+
+        # Determine websockify path from current venv
+        WebsockifyPath = os.path.join(sys.prefix, "bin", "websockify")
+
+        # --- Start VNC server ---
+        VncServer = subprocess.Popen([
+            "x11vnc",
+            "-display", f":{WebDriverDisplay.display}",
+            "-rfbport", str(VNC_PORT),  # force fixed port
+            "-forever",       # keep serving after client disconnects
+            "-nopw",          # no password
+            "-listen", "127.0.0.1",  # restrict to localhost
+            "-xkb"            # better keyboard handling
+        ],
+            stdout=ServerLogFile,
+            stderr=ServerLogFile
+        )
+
+        # Give it time to start
+        time.sleep(1)
+
+        # --- Launch websockify / noVNC ---
+        # Add --web pointing to your noVNC folder
+        NoVNCPath = "/home/frank/noVNC"  # adjust if your noVNC clone is elsewhere
+
+        VncWebSock = subprocess.Popen([
+            WebsockifyPath,
+            "6080",                  # port for browser
+            f"127.0.0.1:{VNC_PORT}", # the VNC server to proxy
+            "--web", NoVNCPath       # serve noVNC HTML/JS files
+        ],
+            stdout=ServerLogFile,
+            stderr=ServerLogFile
+        )
+        # Give it time to start
+        time.sleep(1)
+
 
     options = uc.ChromeOptions()
     options.binary_location = "/snap/bin/chromium"  # adjust path
     options.add_argument("--no-sandbox")
     options.add_argument("--disable-dev-shm-usage")
-    Driver = uc.Chrome(version_main=146, options=options)
-    Driver.get(url)
+    WebDriver = uc.Chrome(version_main=146, options=options)
+    WebDriver.get(url)
     monitor_stayloggedout()
-
-    print(Driver.title)
-    time.sleep(random.uniform(1, 3))
+    print(WebDriver.title)
 
 def EndSession():
-    global HiddenDisplay, Driver
+    global WebDriverDisplay, WebDriver, VncServer, VncWebSock
 
     def kill_chrome():
         try:
@@ -337,26 +383,40 @@ def EndSession():
         except Exception:
             pass
 
-    if Driver:
+    if WebDriver:
         try:
-            Driver.quit()
+            WebDriver.quit()
         except Exception:
             pass
-        Driver = None
+        WebDriver = None
 
     # Give Chrome time to die gracefully
-    time.sleep(1)
-
     kill_chrome()
+    time.sleep(2)
 
-    time.sleep(1)
-
-    if HiddenDisplay:
+    if VncWebSock:
         try:
-            HiddenDisplay.stop()
+            VncWebSock.terminate()
         except Exception:
             pass
-        HiddenDisplay = None
+        VncWebSock = None
+    time.sleep(2)
+
+    if VncServer:
+        try:
+            VncServer.terminate()
+        except Exception:
+            pass
+        VncServer = None
+
+    time.sleep(2)
+
+    if WebDriverDisplay:
+        try:
+            WebDriverDisplay.stop()
+        except Exception:
+            pass
+        WebDriverDisplay = None
 
 def GetResponse(prompt):
     global Count
@@ -366,19 +426,19 @@ def GetResponse(prompt):
         #wait for the copy button count to increase
         #print(f"Count:{Count}")
         selector = "button.text-token-text-secondary"
-        new_count = wait_for_visible_count_to_increase(Driver, selector, Count, timeout=30)
+        new_count = wait_for_visible_count_to_increase(WebDriver, selector, Count, timeout=30)
         Count = new_count
         #print(f"NewCount:{new_count}")
         #print(3)
         
         # Wait for the text changes to become stable
         locator = (By.CSS_SELECTOR, "main")
-        new_stable_text = wait_for_text_stable(Driver, locator, stable_text, timeout=60, poll_frequency=0.2, stable_time=1.3)
+        new_stable_text = wait_for_text_stable(WebDriver, locator, stable_text, timeout=60, poll_frequency=0.2, stable_time=1.3)
         stable_text = new_stable_text
         #print(f"Stable Text:{stable_text}")
         #print(4)
         # Parse HTML
-        soup = BeautifulSoup(Driver.page_source, "html.parser")
+        soup = BeautifulSoup(WebDriver.page_source, "html.parser")
         #print(5)
         # Step 2: get all sections
         sections = soup.find_all("section")
@@ -410,17 +470,28 @@ def ColouriseLastInput(prompt):
     print(f"\033[34m{prompt.capitalize()}\033[0m")
 
 def PromptLoop():
-    global Driver
+    global WebDriver, WebDriverDisplay, ServerLogFile
     promptText = ""
+    help_text = """
+    quit - ends the session closing the webdriver
+    view display - displays the chromium window in vnc
+    """
+
+    def write_prompt(clearPromptfield=False):
+        nonlocal promptText, prompt_field
+        if(clearPromptfield):
+            for _ in promptText:
+                prompt_field.send_keys(Keys.BACKSPACE)
+        promptText = ""
+        print(f"\033[34m\nYou:\033[0m", end="", flush=True)
 
     def GetPromptField():
         nonlocal promptText
-        prompt_field = WebDriverWait(Driver, 10).until(
-                        EC.element_to_be_clickable((By.XPATH, "//p[contains(@class, 'placeholder')]"))
-            )
-        promptText = ""
+        prompt_field = WebDriverWait(WebDriver, 10).until(
+                    EC.element_to_be_clickable((By.XPATH, "//p[contains(@class, 'placeholder')]"))
+        )
         prompt_field.click()
-        print(f"\033[34m\nYou:\033[0m", end="", flush=True)
+        write_prompt()        
         return prompt_field
 
     pyperclip.copy("During this conversation keep all responses as terse as possible while relaying all of the requested information. ")
@@ -436,9 +507,21 @@ def PromptLoop():
             if promptText.lower() == "quit":
                 print("Exiting ...")
                 break  # stops the loop
+            elif promptText.lower() == "view display":
+                # Launch VNC viewer
+                subprocess.Popen(
+                    ["firefox", "http://127.0.0.1:6080/vnc.html", # Open the URL using the default browser chosen by the OS
+                     "--new‐window"],
+                    stdout=ServerLogFile,
+                    stderr=ServerLogFile
+                )
+                write_prompt(True)
 
+            elif promptText.lower() == "/help":
+                print(help_text)
+                write_prompt(True)
             else:
-                submit_btn = WebDriverWait(Driver, 10).until(
+                submit_btn = WebDriverWait(WebDriver, 10).until(
                     EC.element_to_be_clickable((By.XPATH, "//button[contains(@class, 'composer-submit-btn')]"))
                 )
                 submit_btn.click()
